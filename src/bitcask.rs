@@ -1,3 +1,5 @@
+//! Loosely implemented based on the BitCask paper: <https://riak.com/assets/bitcask-intro.pdf>
+
 use std::collections::btree_map;
 use std::{
     collections::{BTreeMap, HashMap},
