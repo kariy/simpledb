@@ -1,3 +1,3 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-mod bitcask;
+pub mod storage;
