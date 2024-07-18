@@ -62,7 +62,7 @@ impl BitCask {
             let id: u8 = 0;
             let file_path = root_path.join(0.to_string()).with_extension(FILE_EXT);
             let mut file = fs::File::create_new(file_path)?;
-            file.write_all(&id.to_be_bytes());
+            file.write_all(&id.to_be_bytes())?;
             bitcask.files.insert(id, file);
         }
 
@@ -86,7 +86,7 @@ impl BitCask {
 
         let mut buffer = vec![0; *size as usize];
         reader.seek(SeekFrom::Start(*offset))?;
-        reader.read_exact(&mut buffer);
+        reader.read_exact(&mut buffer)?;
         Ok((Some(buffer)))
     }
 
