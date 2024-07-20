@@ -1,5 +1,5 @@
 use crate::storage::engine::Engine;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -253,7 +253,7 @@ mod tests {
         write_txn.put(b"key2".to_vec(), b"value2".to_vec());
         write_txn.commit().unwrap();
 
-        // The read transaction should still not see the new data
+        // The first read transaction should still not see the new data
         assert_eq!(read_txn.get(b"key1".to_vec()).unwrap(), None);
         assert_eq!(read_txn.get(b"key2".to_vec()).unwrap(), None);
 
@@ -266,6 +266,46 @@ mod tests {
         assert_eq!(
             new_read_txn.get(b"key2".to_vec()).unwrap(),
             Some(b"value2".to_vec())
+        );
+    }
+
+    // this could be merged with the non repeatable read test
+    #[test]
+    fn test_read_only_with_ongoing_write() {
+        let txn_manager = setup();
+
+        // Initialize data
+        let mut init_txn = txn_manager.create_rw_txn().unwrap();
+        init_txn.put(b"key".to_vec(), b"initial_value".to_vec());
+        init_txn.commit().unwrap();
+
+        // Start a write transaction
+        let mut write_txn = txn_manager.create_rw_txn().unwrap();
+        write_txn.put(b"key".to_vec(), b"new_value".to_vec());
+
+        // Create a read-only transaction while the write transaction is ongoing
+        let read_txn = txn_manager.create_ro_txn().unwrap();
+
+        // The read-only transaction should see the initial value
+        assert_eq!(
+            read_txn.get(b"key".to_vec()).unwrap(),
+            Some(b"initial_value".to_vec())
+        );
+
+        // Commit the write transaction
+        write_txn.commit().unwrap();
+
+        // The read-only transaction should still see the initial value
+        assert_eq!(
+            read_txn.get(b"key".to_vec()).unwrap(),
+            Some(b"initial_value".to_vec())
+        );
+
+        // A new read-only transaction should see the new value
+        let new_read_txn = txn_manager.create_ro_txn().unwrap();
+        assert_eq!(
+            new_read_txn.get(b"key".to_vec()).unwrap(),
+            Some(b"new_value".to_vec())
         );
     }
 }
