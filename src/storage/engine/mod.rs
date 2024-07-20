@@ -1,4 +1,5 @@
 pub mod bitcask;
+pub mod memory;
 
 /// A simple trait for allowing pluggable key/value storage engine
 pub trait Engine {
