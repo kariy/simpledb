@@ -1,5 +1,5 @@
 use crate::storage::engine::Engine;
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -104,13 +104,8 @@ pub struct TxnManager<E: Engine> {
 }
 
 impl<E: Engine> TxnManager<E> {
-    fn create_ro_txn(&self) -> TxnRO<E> {
+    fn create_ro_txn(&self) -> Result<TxnRO<E>> {
         let mut this = self.inner.lock();
-
-        // return error if there's a ongoing write txn
-        if this.write_txn.is_some() {
-            panic!("There's already a write txn ongoing");
-        }
 
         let id = this.next_id;
         this.next_id += 1;
@@ -120,22 +115,22 @@ impl<E: Engine> TxnManager<E> {
         let engine = Arc::clone(&self.engine);
         let versioned_cache = Arc::clone(&self.versioned_cache);
 
-        TxnRO {
+        Ok(TxnRO {
             inner: Txn {
                 id,
                 engine,
                 txn_manager,
                 versioned_cache,
             },
-        }
+        })
     }
 
-    fn create_rw_txn(&self) -> TxnRW<E> {
+    fn create_rw_txn(&self) -> Result<TxnRW<E>> {
         let mut this = self.inner.lock();
 
         // return error if there's a ongoing write txn
         if this.write_txn.is_some() {
-            panic!("There's already a write txn ongoing");
+            bail!("There's already a write txn ongoing");
         }
 
         let id = this.next_id;
@@ -146,7 +141,7 @@ impl<E: Engine> TxnManager<E> {
         let engine = Arc::clone(&self.engine);
         let versioned_cache = Arc::clone(&self.versioned_cache);
 
-        TxnRW {
+        Ok(TxnRW {
             write_cache: BTreeMap::new(),
             inner: Txn {
                 id,
@@ -154,7 +149,7 @@ impl<E: Engine> TxnManager<E> {
                 txn_manager,
                 versioned_cache,
             },
-        }
+        })
     }
 }
 
@@ -201,15 +196,12 @@ mod tests {
         let txn_manager = setup();
 
         // Start a write transaction
-        let write_txn1 = txn_manager.create_rw_txn();
+        let write_txn1 = txn_manager.create_rw_txn().unwrap();
 
-        // Attempt to start another write transaction
-        let result = std::panic::catch_unwind(|| {
-            txn_manager.create_rw_txn();
-        });
-
-        // Assert that creating a second write transaction panics
-        assert!(result.is_err());
+        // Attempt to start another write transaction while there's an ongoing
+        // write transaction should fail
+        let err = txn_manager.create_rw_txn().unwrap_err().to_string();
+        assert!(err.contains("There's already a write txn ongoing"));
 
         // Commit the first write transaction
         write_txn1.commit().unwrap();
@@ -223,21 +215,27 @@ mod tests {
         let txn_manager = setup();
 
         // Initialize data
-        let mut init_txn = txn_manager.create_rw_txn();
+        let mut init_txn = txn_manager.create_rw_txn().unwrap();
         init_txn.put(b"key".to_vec(), b"value1".to_vec());
         init_txn.commit().unwrap();
 
         // Start a read transaction
-        let read_txn = txn_manager.create_ro_txn();
-        assert_eq!(read_txn.get(b"key".to_vec()).unwrap(), Some(b"value1".to_vec()));
+        let read_txn = txn_manager.create_ro_txn().unwrap();
+        assert_eq!(
+            read_txn.get(b"key".to_vec()).unwrap(),
+            Some(b"value1".to_vec())
+        );
 
         // Start a write transaction and modify the data
-        let mut write_txn = txn_manager.create_rw_txn();
+        let mut write_txn = txn_manager.create_rw_txn().unwrap();
         write_txn.put(b"key".to_vec(), b"value2".to_vec());
         write_txn.commit().unwrap();
 
         // The read transaction should still see the old value
-        assert_eq!(read_txn.get(b"key".to_vec()).unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(
+            read_txn.get(b"key".to_vec()).unwrap(),
+            Some(b"value1".to_vec())
+        );
     }
 
     #[test]
@@ -245,12 +243,12 @@ mod tests {
         let txn_manager = setup();
 
         // Start a read transaction
-        let read_txn = txn_manager.create_ro_txn();
+        let read_txn = txn_manager.create_ro_txn().unwrap();
         assert_eq!(read_txn.get(b"key1".to_vec()).unwrap(), None);
         assert_eq!(read_txn.get(b"key2".to_vec()).unwrap(), None);
 
         // Start a write transaction and add new data
-        let mut write_txn = txn_manager.create_rw_txn();
+        let mut write_txn = txn_manager.create_rw_txn().unwrap();
         write_txn.put(b"key1".to_vec(), b"value1".to_vec());
         write_txn.put(b"key2".to_vec(), b"value2".to_vec());
         write_txn.commit().unwrap();
@@ -260,8 +258,14 @@ mod tests {
         assert_eq!(read_txn.get(b"key2".to_vec()).unwrap(), None);
 
         // A new read transaction should see the new data
-        let new_read_txn = txn_manager.create_ro_txn();
-        assert_eq!(new_read_txn.get(b"key1".to_vec()).unwrap(), Some(b"value1".to_vec()));
-        assert_eq!(new_read_txn.get(b"key2".to_vec()).unwrap(), Some(b"value2".to_vec()));
+        let new_read_txn = txn_manager.create_ro_txn().unwrap();
+        assert_eq!(
+            new_read_txn.get(b"key1".to_vec()).unwrap(),
+            Some(b"value1".to_vec())
+        );
+        assert_eq!(
+            new_read_txn.get(b"key2".to_vec()).unwrap(),
+            Some(b"value2".to_vec())
+        );
     }
 }

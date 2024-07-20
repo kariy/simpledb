@@ -1,10 +1,10 @@
-
-use std::collections::HashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 
 use super::Engine;
 
 /// An in-memory storage engine for testing purposes
+#[derive(Debug)]
 pub struct MemoryEngine {
     data: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
 }
