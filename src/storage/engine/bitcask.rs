@@ -9,9 +9,24 @@ use std::{
     time::SystemTime,
 };
 
+/// Tombstone value to indicate a deleted key.
+const TOMBSTONE: i8 = -1;
+/// The file extension for the data files.
 const FILE_EXT: &str = "cask";
 
-type Result<T> = std::result::Result<T, std::io::Error>;
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("file id {0} is missing")]
+    MissingFile(FileId),
+
+    #[error("failed to get current timestamp: {0}")]
+    TimestampError(#[from] std::time::SystemTimeError),
+}
+
+type Result<T> = std::result::Result<T, Error>;
 
 type Key = Vec<u8>;
 type Value = Vec<u8>;
@@ -54,7 +69,7 @@ impl BitCask {
             if entry.file_type()?.is_dir() {
                 let path = entry.path();
                 let mut file = fs::OpenOptions::new().read(true).append(true).open(path)?;
-                bitcask.read_file(&mut file)?;
+                bitcask.build_keydir_from_file(&mut file)?;
             }
         }
 
@@ -81,24 +96,30 @@ impl BitCask {
             ..
         } = value;
 
-        let file = self.files.get(file_id).expect("missing file");
+        let file = self
+            .files
+            .get(file_id)
+            .ok_or(Error::MissingFile(*file_id))?;
         let mut reader = BufReader::new(file);
 
         let mut buffer = vec![0; *size as usize];
         reader.seek(SeekFrom::Start(*offset))?;
         reader.read_exact(&mut buffer)?;
-        Ok((Some(buffer)))
+        Ok(Some(buffer))
     }
 
     // if the file has reached a certain size, insert to a new file
     pub fn put(&mut self, key: Key, value: Value) -> Result<()> {
         let file_id = self.latest_file;
-        let file = self.files.get(&file_id).expect("missing file");
+        let file = self
+            .files
+            .get(&file_id)
+            .ok_or(Error::MissingFile(file_id))?;
         let mut bufwriter = BufWriter::new(file);
 
         let pos = bufwriter.seek(SeekFrom::End(0))?;
 
-        let timestamp = unix_epoch_now();
+        let timestamp = unix_epoch_now()?;
         let offset = pos + 8 + 8 + 8 + key.len() as u64;
         let location = ValueLocation {
             offset,
@@ -122,18 +143,25 @@ impl BitCask {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: Key) {
-        todo!()
+    /// Deletion in bitcask is done by simply appending a log entry with a special tombstone value
+    /// indicating that the key has been deleted. The key is then removed from the keydir.
+    pub fn delete(&mut self, key: Key) -> Result<()> {
+        self.put(key.clone(), TOMBSTONE.to_be_bytes().to_vec())?;
+        self.keydir.remove(&key);
+        Ok(())
     }
 
+    /// Returns an iterator over the key-value pairs in the database.
     pub fn iter(&self) -> Iter<'_> {
         Iter::new(self)
     }
 
+    /// Returns an iterator over the keys in the database.
     pub fn keys(&self) -> Keys<'_> {
         Keys::new(self)
     }
 
+    /// Returns an iterator over the values in the database.
     pub fn values(&self) -> Values<'_> {
         Values::new(self)
     }
@@ -149,11 +177,11 @@ impl BitCask {
         Ok(())
     }
 
-    fn read_file(&mut self, file: &mut File) -> Result<()> {
+    fn build_keydir_from_file(&mut self, file: &mut File) -> Result<()> {
         let file_len = file.metadata()?.len();
 
         let mut reader = std::io::BufReader::new(file);
-        reader.seek(SeekFrom::Start(0));
+        reader.seek(SeekFrom::Start(0))?;
         let mut position: u64 = 0;
 
         // the first byte of the file is always the file id
@@ -213,7 +241,9 @@ impl BitCask {
 /// Close the BitCask instance and flush all data to disk.
 impl Drop for BitCask {
     fn drop(&mut self) {
-        self.sync();
+        if let Err(e) = self.sync() {
+            eprintln!("Failed to sync files: {:?}", e);
+        }
     }
 }
 
@@ -235,14 +265,23 @@ impl<'a> std::iter::Iterator for Iter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let (key, loc) = self.inner.next()?;
-        let file = self.files.get(&loc.file_id).expect("missing file");
+        let file = match self.files.get(&loc.file_id) {
+            Some(file) => file,
+            None => return Some((key, Err(Error::MissingFile(loc.file_id)))),
+        };
 
         let mut reader = BufReader::new(file);
         let offset = SeekFrom::Start(loc.offset);
-        reader.seek(offset).map(Some).transpose()?;
+        let seek_result = reader.seek(offset).map_err(Error::from);
+        if let Err(e) = seek_result {
+            return Some((key, Err(e)));
+        }
 
         let mut value = vec![0; loc.size as usize];
-        reader.read_exact(&mut value).map(Some).transpose()?;
+        let read_result = reader.read_exact(&mut value).map_err(Error::from);
+        if let Err(e) = read_result {
+            return Some((key, Err(e)));
+        }
 
         Some((key, Ok(value)))
     }
@@ -286,11 +325,9 @@ impl<'a> std::iter::Iterator for Values<'a> {
     }
 }
 
-fn unix_epoch_now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("should get current unix timestamp")
-        .as_secs()
+fn unix_epoch_now() -> Result<u64> {
+    let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+    Ok(time.as_secs())
 }
 
 #[cfg(test)]
@@ -301,7 +338,7 @@ mod tests {
     #[test]
     fn open_empty() {
         let temp_dir = tempdir().unwrap();
-        let mut db = BitCask::open(temp_dir.path()).unwrap();
+        let db = BitCask::open(temp_dir.path()).unwrap();
 
         assert!(db.keydir.is_empty());
         assert_eq!(db.files.len(), 1);
@@ -332,6 +369,25 @@ mod tests {
         // Check if the file has been updated
         let file = db.files.get(&db.latest_file).unwrap();
         assert!(file.metadata().unwrap().len() > 1);
+    }
+
+    #[test]
+    fn delete() {
+        let temp_dir = tempdir().unwrap();
+        let mut db = BitCask::open(temp_dir.path()).unwrap();
+
+        let key = b"test_key".to_vec();
+        let value = b"test_value".to_vec();
+
+        // Insert a key-value pair
+        db.put(key.clone(), value).unwrap();
+        assert!(db.get(&key).unwrap().is_some());
+
+        // Delete the key
+        db.delete(key.clone()).unwrap();
+
+        // Verify that the key has been deleted
+        assert_eq!(db.get(&key).unwrap(), None);
     }
 
     #[test]
