@@ -177,3 +177,91 @@ struct TxnManagerInner {
     // there could only be 1 write txn at a time.
     write_txn: Option<TxnId>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::engine::memory::MemoryEngine;
+
+    fn setup() -> TxnManager<MemoryEngine> {
+        let engine = Arc::new(Mutex::new(MemoryEngine::new()));
+        TxnManager {
+            engine,
+            inner: Arc::new(Mutex::new(TxnManagerInner {
+                next_id: 0,
+                read_txns: HashSet::new(),
+                write_txn: None,
+            })),
+            versioned_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    #[test]
+    fn test_single_write_transaction() {
+        let txn_manager = setup();
+
+        // Start a write transaction
+        let write_txn1 = txn_manager.create_rw_txn();
+
+        // Attempt to start another write transaction
+        let result = std::panic::catch_unwind(|| {
+            txn_manager.create_rw_txn();
+        });
+
+        // Assert that creating a second write transaction panics
+        assert!(result.is_err());
+
+        // Commit the first write transaction
+        write_txn1.commit().unwrap();
+
+        // Now we should be able to create a new write transaction
+        let _write_txn2 = txn_manager.create_rw_txn();
+    }
+
+    #[test]
+    fn test_no_non_repeatable_reads() {
+        let txn_manager = setup();
+
+        // Initialize data
+        let mut init_txn = txn_manager.create_rw_txn();
+        init_txn.put(b"key".to_vec(), b"value1".to_vec());
+        init_txn.commit().unwrap();
+
+        // Start a read transaction
+        let read_txn = txn_manager.create_ro_txn();
+        assert_eq!(read_txn.get(b"key".to_vec()).unwrap(), Some(b"value1".to_vec()));
+
+        // Start a write transaction and modify the data
+        let mut write_txn = txn_manager.create_rw_txn();
+        write_txn.put(b"key".to_vec(), b"value2".to_vec());
+        write_txn.commit().unwrap();
+
+        // The read transaction should still see the old value
+        assert_eq!(read_txn.get(b"key".to_vec()).unwrap(), Some(b"value1".to_vec()));
+    }
+
+    #[test]
+    fn test_no_phantom_reads() {
+        let txn_manager = setup();
+
+        // Start a read transaction
+        let read_txn = txn_manager.create_ro_txn();
+        assert_eq!(read_txn.get(b"key1".to_vec()).unwrap(), None);
+        assert_eq!(read_txn.get(b"key2".to_vec()).unwrap(), None);
+
+        // Start a write transaction and add new data
+        let mut write_txn = txn_manager.create_rw_txn();
+        write_txn.put(b"key1".to_vec(), b"value1".to_vec());
+        write_txn.put(b"key2".to_vec(), b"value2".to_vec());
+        write_txn.commit().unwrap();
+
+        // The read transaction should still not see the new data
+        assert_eq!(read_txn.get(b"key1".to_vec()).unwrap(), None);
+        assert_eq!(read_txn.get(b"key2".to_vec()).unwrap(), None);
+
+        // A new read transaction should see the new data
+        let new_read_txn = txn_manager.create_ro_txn();
+        assert_eq!(new_read_txn.get(b"key1".to_vec()).unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(new_read_txn.get(b"key2".to_vec()).unwrap(), Some(b"value2".to_vec()));
+    }
+}
