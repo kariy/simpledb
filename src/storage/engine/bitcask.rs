@@ -1,4 +1,24 @@
 //! Loosely implemented based on the BitCask paper: <https://riak.com/assets/bitcask-intro.pdf>
+//!
+//! +------------------------------------------------------------------------------+
+//! |                               BitCask File                                   |
+//! +------------------------------------------------------------------------------+
+//! | File ID (1 byte)                                                             |
+//! +------------------------------------------------------------------------------+
+//! |                                Log entries                                   |
+//! +------------------------------------------------------------------------------+
+//! | Timestamp  | Key Size   | Value Size | Key              | Value              |
+//! | (8 bytes)  | (8 bytes)  | (8 bytes)  | (variable size)  | (variable size)    |
+//! +------------+------------+------------+------------------+--------------------+
+//! | Timestamp  | Key Size   | Value Size | Key              | Value              |
+//! | (8 bytes)  | (8 bytes)  | (8 bytes)  | (variable size)  | (variable size)    |
+//! +------------+------------+------------+------------------+--------------------+
+//! | ...        | ...        | ...        | ...              | ...                |
+//! +------------+------------+------------+------------------+--------------------+
+//! | Timestamp  | Key Size   | Value Size | Key              | Value              |
+//! | (8 bytes)  | (8 bytes)  | (8 bytes)  | (variable size)  | (variable size)    |
+//! +------------+------------+------------+------------------+--------------------+
+//!
 
 use std::collections::btree_map;
 use std::{
@@ -48,6 +68,7 @@ struct ValueLocation {
 /// An index of keys to their value's locations in the file.
 type KeyDir = BTreeMap<Key, ValueLocation>;
 
+#[derive(Debug)]
 pub struct BitCask {
     keydir: KeyDir,
     /// The id of the latest file.
