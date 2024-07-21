@@ -18,14 +18,12 @@
 //! +------------+------------+------------+------------------+--------------------+
 //!
 
+use memmap2::{MmapMut, MmapOptions};
 use std::collections::btree_map;
-use std::{
-    collections::{BTreeMap, HashMap},
-    fs::{self, File},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::Path,
-    time::SystemTime,
-};
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::{path::Path, time::SystemTime};
 
 /// Tombstone value to indicate a deleted key.
 const TOMBSTONE: i8 = -1;
@@ -72,6 +70,7 @@ pub struct BitCask {
     /// The id of the latest file.
     latest_file: FileId,
     files: HashMap<FileId, File>,
+    mmaped_files: HashMap<FileId, MmapMut>,
 }
 
 impl BitCask {
@@ -80,6 +79,7 @@ impl BitCask {
             latest_file: 0,
             files: HashMap::new(),
             keydir: BTreeMap::new(),
+            mmaped_files: HashMap::new(),
         };
 
         let root_path = path.as_ref();
@@ -87,8 +87,11 @@ impl BitCask {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 let path = entry.path();
-                let mut file = fs::OpenOptions::new().read(true).append(true).open(path)?;
-                bitcask.build_keydir_from_file(&mut file)?;
+                let file = fs::OpenOptions::new().read(true).append(true).open(path)?;
+
+                // TODO: add check for magic number, if not present, skip instead of blindly
+                // processing the file.
+                bitcask.build_keydir_from_file(file)?;
             }
         }
 
@@ -97,6 +100,9 @@ impl BitCask {
             let file_path = root_path.join(0.to_string()).with_extension(FILE_EXT);
             let mut file = fs::File::create_new(file_path)?;
             file.write_all(&id.to_be_bytes())?;
+
+            let mmapped = unsafe { MmapOptions::new().map_mut(&file)? };
+            bitcask.mmaped_files.insert(id, mmapped);
             bitcask.files.insert(id, file);
         }
 
@@ -116,15 +122,15 @@ impl BitCask {
         } = value;
 
         let file = self
-            .files
+            .mmaped_files
             .get(file_id)
             .ok_or(Error::MissingFile(*file_id))?;
-        let mut reader = BufReader::new(file);
 
-        let mut buffer = vec![0; *size as usize];
-        reader.seek(SeekFrom::Start(*offset))?;
-        reader.read_exact(&mut buffer)?;
-        Ok(Some(buffer))
+        let start = *offset as usize;
+        let end = start + (*size as usize);
+        let buffer = &file[start..end];
+
+        Ok(Some(buffer.to_vec()))
     }
 
     // if the file has reached a certain size, insert to a new file
@@ -158,6 +164,11 @@ impl BitCask {
         bufwriter.write_all(&buffer)?;
         bufwriter.flush()?;
         self.keydir.insert(key, location);
+
+        // mmap the file again because the file has grown
+        drop(bufwriter);
+        let mmaped = unsafe { MmapOptions::new().map_mut(file)? };
+        self.mmaped_files.insert(file_id, mmaped);
 
         Ok(())
     }
@@ -196,10 +207,10 @@ impl BitCask {
         Ok(())
     }
 
-    fn build_keydir_from_file(&mut self, file: &mut File) -> Result<()> {
+    fn build_keydir_from_file(&mut self, mut file: File) -> Result<()> {
         let file_len = file.metadata()?.len();
 
-        let mut reader = std::io::BufReader::new(file);
+        let mut reader = std::io::BufReader::new(&mut file);
         reader.seek(SeekFrom::Start(0))?;
         let mut position: u64 = 0;
 
@@ -252,6 +263,10 @@ impl BitCask {
         if self.latest_file < file_id {
             self.latest_file = file_id;
         }
+
+        let mmapped = unsafe { MmapOptions::new().map_mut(&file)? };
+        self.mmaped_files.insert(file_id, mmapped);
+        self.files.insert(file_id, file);
 
         Ok(())
     }

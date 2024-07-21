@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.86"
+memmap2 = "0.9.4"
 parking_lot = "0.12.3"
 thiserror = "1.0.63"
 
