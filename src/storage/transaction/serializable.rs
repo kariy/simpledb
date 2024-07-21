@@ -1,110 +1,142 @@
 use crate::storage::engine::Engine;
 use anyhow::{bail, Result};
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 type TxnId = u64;
 
 #[derive(Debug)]
-pub struct TxnRO<E: Engine> {
-    inner: Txn<E>,
-}
+pub struct TxnRO<'a, E: Engine>(Txn<'a, E>);
 
-impl<E: Engine> TxnRO<E> {
+impl<'a, E: Engine> TxnRO<'a, E> {
     pub fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
+        self.0.get(key)
     }
 
     // try to read from the cache first.
     // if its not in the cache, get it from the engine then put it in the cache. pub fn get(&self, key: Vec<u8>) {}
     pub fn commit(self) {
-        let tx_id = self.inner.id;
-        let mut txn_manager = self.inner.txn_manager.inner.lock();
+        let tx_id = self.0.id;
+        let mut txn_manager = self.0.txn_manager.inner.lock();
         txn_manager.read_txns.remove(&tx_id);
     }
 }
 
 #[derive(Debug)]
-pub struct TxnRW<E: Engine> {
-    inner: Txn<E>,
-    write_cache: BTreeMap<Vec<u8>, Vec<u8>>,
+pub struct TxnRW<'a, E: Engine> {
+    inner: Txn<'a, E>,
+    write_cache: BTreeMap<Vec<u8>, Cow<'a, Vec<u8>>>,
 }
 
-impl<E: Engine> TxnRW<E> {
+impl<'a, E: Engine> TxnRW<'a, E> {
     // try to read from the cache first.
     // if its not in the cache, get it from the engine then put it in the cache.
     pub fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        if let value @ Some(_) = self.write_cache.get(&key) {
-            Ok(value.cloned())
+        if let Some(value) = self.write_cache.get(&key) {
+            Ok(Some(value.as_ref().clone()))
         } else {
             self.inner.get(key)
         }
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.write_cache.insert(key, value);
+        self.write_cache.insert(key, Cow::Owned(value));
     }
 
     pub fn commit(self) -> Result<()> {
         let version = self.inner.id;
         let mut engine = self.inner.engine.lock();
-        let mut versioned_cache = self.inner.versioned_cache.lock();
+        // create an independent copy of the versioned cache
+        let mut versioned_cache = self.inner.versioned_cache.lock().clone();
 
         // remove the write txn id from the txn manager
         let mut txn_manager = self.inner.txn_manager.inner.lock();
         let _ = txn_manager.write_txn.take();
 
-        // write the cache to the engine
+        // write the cache to the engine and insert into our independent versioned cache
         for (key, value) in self.write_cache {
-            engine.set(key.clone(), value.clone())?;
-            versioned_cache
-                .entry(key)
-                .or_default()
-                .insert(version, value);
+            engine.set(&key, value.as_ref().clone())?;
+
+            let key = Cow::Owned(key);
+            if let Some(Some(entry)) = versioned_cache.get_mut(&key) {
+                entry.insert(version, value);
+            } else {
+                // create a btreemap and insert the current version and value
+                let entry = BTreeMap::from([(version, value)]);
+                versioned_cache.insert(key, Some(entry));
+            }
         }
 
+        // Update the shared versioned cache with our independent copy
+        *self.inner.txn_manager.versioned_cache.lock() = Arc::new(versioned_cache.into());
         Ok(())
     }
 }
 
 #[derive(Debug)]
-struct Txn<E: Engine> {
+struct Txn<'a, E: Engine> {
     id: TxnId,
     engine: Arc<Mutex<E>>,
-    txn_manager: TxnManager<E>,
-    versioned_cache: Arc<Mutex<BTreeMap<Vec<u8>, BTreeMap<TxnId, Vec<u8>>>>>,
+    txn_manager: TxnManager<'a, E>,
+    versioned_cache:
+        Arc<Mutex<BTreeMap<Cow<'a, Vec<u8>>, Option<BTreeMap<TxnId, Cow<'a, Vec<u8>>>>>>>,
 }
 
-impl<E: Engine> Txn<E> {
+impl<'a, E: Engine> Txn<'a, E> {
     fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        if let Some(entries) = self.versioned_cache.lock().get(&key) {
-            // Find the first entry whose version is less than or equal
-            // to the current txn id.
-            let mut versioned_entries = entries.iter().rev();
-            let val = versioned_entries
-                .find(|(ver, _)| &self.id >= *ver)
-                .map(|(_, value)| value.clone());
+        match self.versioned_cache.lock().get(&key) {
+            Some(Some(entries)) => {
+                // Find the first entry whose version is less than or equal
+                // to the current txn id.
+                let mut versioned_entries = entries.iter().rev();
+                let val = versioned_entries
+                    .find(|(ver, _)| &self.id >= *ver)
+                    .map(|(_, value)| value.as_ref().clone());
 
-            Ok(val)
-        } else {
-            // get from the underlying engine
-            let engine = self.engine.lock();
-            let value = engine.get(key)?.map(|v| v.as_ref().to_vec());
-            Ok(value)
+                return Ok(val);
+            }
+
+            Some(None) => return Ok(None),
+            None => {}
         }
+
+        // get from the underlying engine
+        let engine = self.engine.lock();
+        let value = engine.get(&key)?.map(|v| v.as_ref().to_vec());
+
+        // put it in the cache and return the value
+        let cache_value = if let Some(ref value) = value {
+            Some(BTreeMap::from([(self.id, Cow::Owned(value.clone()))]))
+        } else {
+            None
+        };
+
+        let mut cache = self.versioned_cache.lock();
+        let entry = cache.entry(Cow::Owned(key)).or_default();
+        *entry = cache_value;
+
+        Ok(value)
     }
 }
 
 #[derive(Debug)]
-pub struct TxnManager<E: Engine> {
+pub struct TxnManager<'a, E: Engine> {
     engine: Arc<Mutex<E>>,
     inner: Arc<Mutex<TxnManagerInner>>,
-    versioned_cache: Arc<Mutex<BTreeMap<Vec<u8>, BTreeMap<TxnId, Vec<u8>>>>>,
+
+    // the first layer of Arc<Mutex<...>> is for filling up the cache from the engine query.
+    // the second layer of Arc<Mutex<...>> is setting the new BTreemap to the cache.
+    // idk what im talking, at least i understand this in my head (for now).
+    versioned_cache: Arc<Mutex<VersionedCache<'a>>>,
 }
 
-impl<E: Engine> TxnManager<E> {
-    fn create_ro_txn(&self) -> Result<TxnRO<E>> {
+type VersionedCache<'a> =
+    Arc<Mutex<BTreeMap<Cow<'a, Vec<u8>>, Option<BTreeMap<TxnId, Cow<'a, Vec<u8>>>>>>>;
+
+impl<'a, E: Engine> TxnManager<'a, E> {
+    fn create_ro_txn(&self) -> Result<TxnRO<'a, E>> {
         let mut this = self.inner.lock();
 
         let id = this.next_id;
@@ -113,19 +145,17 @@ impl<E: Engine> TxnManager<E> {
 
         let txn_manager = self.clone();
         let engine = Arc::clone(&self.engine);
-        let versioned_cache = Arc::clone(&self.versioned_cache);
+        let versioned_cache = self.versioned_cache.lock().clone();
 
-        Ok(TxnRO {
-            inner: Txn {
-                id,
-                engine,
-                txn_manager,
-                versioned_cache,
-            },
-        })
+        Ok(TxnRO(Txn {
+            id,
+            engine,
+            txn_manager,
+            versioned_cache,
+        }))
     }
 
-    fn create_rw_txn(&self) -> Result<TxnRW<E>> {
+    fn create_rw_txn(&self) -> Result<TxnRW<'a, E>> {
         let mut this = self.inner.lock();
 
         // return error if there's a ongoing write txn
@@ -139,7 +169,7 @@ impl<E: Engine> TxnManager<E> {
 
         let txn_manager = self.clone();
         let engine = Arc::clone(&self.engine);
-        let versioned_cache = Arc::clone(&self.versioned_cache);
+        let versioned_cache = self.versioned_cache.lock().clone();
 
         Ok(TxnRW {
             write_cache: BTreeMap::new(),
@@ -153,12 +183,12 @@ impl<E: Engine> TxnManager<E> {
     }
 }
 
-impl<E: Engine> Clone for TxnManager<E> {
+impl<'a, E: Engine> Clone for TxnManager<'a, E> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
             engine: Arc::clone(&self.engine),
-            versioned_cache: Arc::clone(&self.versioned_cache),
+            versioned_cache: self.versioned_cache.clone(),
         }
     }
 }
@@ -178,16 +208,16 @@ mod tests {
     use super::*;
     use crate::storage::engine::memory::MemoryEngine;
 
-    fn setup() -> TxnManager<MemoryEngine> {
+    fn setup() -> TxnManager<'static, MemoryEngine> {
         let engine = Arc::new(Mutex::new(MemoryEngine::new()));
         TxnManager {
             engine,
             inner: Arc::new(Mutex::new(TxnManagerInner {
                 next_id: 0,
-                read_txns: HashSet::new(),
                 write_txn: None,
+                read_txns: HashSet::new(),
             })),
-            versioned_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            versioned_cache: Default::default(),
         }
     }
 
