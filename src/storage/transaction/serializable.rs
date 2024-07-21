@@ -132,6 +132,7 @@ pub struct TxnManager<'a, E: Engine> {
     versioned_cache: Arc<Mutex<VersionedCache<'a>>>,
 }
 
+// if None, meaning the key doesn't exist at all.
 type VersionedCache<'a> =
     Arc<Mutex<BTreeMap<Cow<'a, Vec<u8>>, Option<BTreeMap<TxnId, Cow<'a, Vec<u8>>>>>>>;
 
