@@ -1,6 +1,5 @@
 use std::collections::btree_map;
 use std::collections::HashMap;
-use std::io::{BufReader, SeekFrom};
 
 use super::BitCask;
 use super::Error;
