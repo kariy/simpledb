@@ -57,7 +57,7 @@ impl<'a, E: Engine> TxnRW<'a, E> {
 
         // write the cache to the engine and insert into our independent versioned cache
         for (key, value) in self.write_cache {
-            engine.set(&key, value.as_ref().clone())?;
+            engine.set(&key, value.as_ref())?;
 
             let key = Cow::Owned(key);
             if let Some(Some(entry)) = versioned_cache.get_mut(&key) {
@@ -104,7 +104,7 @@ impl<'a, E: Engine> Txn<'a, E> {
 
         // get from the underlying engine
         let engine = self.engine.lock();
-        let value = engine.get(&key)?.map(|v| v.as_ref().to_vec());
+        let value = engine.get(&key)?;
 
         // put it in the cache and return the value
         let cache_value = if let Some(ref value) = value {
