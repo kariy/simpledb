@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self};
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::SystemTimeError;
 use std::{path::Path, time::SystemTime};
 
 /// Tombstone value to indicate a deleted key.
@@ -330,9 +331,10 @@ impl Drop for BitCask {
     }
 }
 
-fn unix_epoch_now() -> Result<u64> {
-    let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
-    Ok(time.as_secs())
+fn unix_epoch_now() -> std::result::Result<u64, SystemTimeError> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|t| t.as_secs())
 }
 
 #[cfg(test)]
